@@ -26,6 +26,8 @@
 
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MagicHash #-}
 
 module Proto3.Wire.Reverse
     ( -- * `BuildR` type
@@ -79,6 +81,8 @@ module Proto3.Wire.Reverse
 
     -- * Helpful combinators
     , foldlRVector
+    , repeatedBuildR
+    , repeatedFixedPrimR
 
     -- * Exported for testing purposes only.
     , testWithUnused
@@ -86,6 +90,7 @@ module Proto3.Wire.Reverse
 
 import           Data.Bits                     ( (.&.) )
 import qualified Data.ByteString               as B
+import qualified Data.ByteString.Internal      as BI
 import qualified Data.ByteString.Lazy          as BL
 import qualified Data.ByteString.Lazy.Internal as BLI
 import qualified Data.ByteString.Short         as BS
@@ -100,6 +105,13 @@ import qualified Data.Text.Short               as TS
 import           Data.Vector.Generic           ( Vector )
 import           Data.Word                     ( Word8, Word16, Word32, Word64 )
 import           Foreign                       ( castPtr, copyBytes )
+import           GHC.Exts                      ( Addr#, Int(..), Int# )
+#if !MIN_VERSION_bytestring(0,11,0)
+import           GHC.Exts                      ( plusAddr# )
+#endif
+import           GHC.ForeignPtr                ( ForeignPtr(..), ForeignPtrContents )
+import           GHC.TypeLits                  ( KnownNat )
+import           Proto3.Wire.Encode.Repeated   ( Repeated(..), ToRepeated(..) )
 import           Proto3.Wire.Reverse.Internal
 import qualified Proto3.Wire.Reverse.Prim      as Prim
 
@@ -134,15 +146,32 @@ toLazyByteString = snd . runBuildR
 -- >>> byteString "ABC"
 -- Proto3.Wire.Reverse.lazyByteString "ABC"
 byteString :: B.ByteString -> BuildR
-byteString bs = withUnused $ \unused ->
-  let len = B.length bs in
-  if len <= unused
-    then
-      unsafeConsume len $ \dst ->
-        BU.unsafeUseAsCString bs $ \src ->
-          copyBytes dst (castPtr src) len
-    else
-      prependChunk bs
+#if MIN_VERSION_bytestring(0,11,0)
+byteString (BI.BS (ForeignPtr ad ct) (I# len)) = byteStringImpl ad ct len
+#else
+byteString (BI.PS (ForeignPtr ad ct) (I# off) (I# len)) = byteStringImpl (plusAddr# ad off) ct len
+#endif
+{-# INLINE byteString #-}
+
+byteStringImpl :: Addr# -> ForeignPtrContents -> Int# -> BuildR
+byteStringImpl ad ct len =
+#if MIN_VERSION_bytestring(0,11,0)
+  let bs = BI.BS (ForeignPtr ad ct) (I# len) in
+#else
+  let bs = BI.PS (ForeignPtr ad ct) 0 (I# len) in
+#endif
+  withUnused $ \unused ->
+    if I# len <= unused
+      then
+        unsafeConsume (I# len) $ \dst ->
+          BU.unsafeUseAsCString bs $ \src ->
+            copyBytes dst (castPtr src) (I# len)
+      else
+        prependChunk bs
+{-# NOINLINE [1] byteStringImpl #-}
+{-# RULES
+    "byteStringImpl/empty" forall ad ct . byteStringImpl ad ct 0# = mempty
+  #-}
 
 -- | Convert a lazy `BL.ByteString` to a `BuildR`
 --
@@ -179,6 +208,10 @@ lazyByteString = etaBuildR $ scan (ReverseChunks BL.empty)
                 copyBytes dst (castPtr src) len
         else
           prependReverseChunks (ReverseChunks(BLI.Chunk c cs))
+{-# NOINLINE [1] lazyByteString #-}
+{-# RULES
+    "lazyByteString/empty" lazyByteString BLI.Empty = mempty
+  #-}
 
 -- | Convert a `BS.ShortByteString` to a `BuildR`
 --
@@ -823,9 +856,40 @@ word64Base128LEVar_inline = \x ->
 {-# INLINE word64Base128LEVar_inline #-}
 
 -- | Essentially 'foldMap', but iterates right to left for efficiency.
+--
+-- See also: 'repeatedBuildR'
 vectorBuildR :: Vector v a => (a -> BuildR) -> v a -> BuildR
 vectorBuildR f = etaBuildR (foldlRVector (\acc x -> acc <> f x) mempty)
 {-# INLINE vectorBuildR #-}
+
+-- | Concatenates the given builders, iterating right to left where practical.
+--
+-- For example:
+--
+-- >>> Data.ByteString.Lazy.unpack (toLazyByteString (repeatedBuildR (map word8 [42,67])))
+-- [42,67]
+--
+-- See also: 'repeatedFixedPrimR', 'vectorBuildR'
+repeatedBuildR :: ToRepeated c BuildR => c -> BuildR
+repeatedBuildR = etaBuildR (foldr (flip (<>)) mempty . reverseRepeated . toRepeated)
+{-# INLINE repeatedBuildR #-}
+
+-- | Concatenates the given fixed-width primitives, iterating right to left where practical
+-- and consolidating space checks if the number of primitives has been predicted.
+--
+-- For example:
+--
+-- >>> Data.ByteString.Lazy.unpack (toLazyByteString (repeatedFixedPrimR (map Proto3.Wire.Reverse.Prim.word8 [42,67])))
+-- [42,67]
+--
+-- See also: 'repeatedBuildR'
+repeatedFixedPrimR :: (ToRepeated c (Prim.FixedPrim w), KnownNat w) => c -> BuildR
+repeatedFixedPrimR = etaBuildR $ \c ->
+  let ReverseRepeated prediction prims = toRepeated c in
+  case prediction of
+    Nothing -> foldr (\p a -> a <> Prim.liftBoundedPrim (Prim.liftFixedPrim p)) mempty prims
+    Just count -> Prim.unsafeReverseFoldMapFixedPrim id count prims
+{-# INLINE repeatedFixedPrimR #-}
 
 -- | Exported for testing purposes only.
 testWithUnused :: (Int -> BuildR) -> BuildR
